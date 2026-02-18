@@ -65,7 +65,7 @@ await Async.forEachAsync(this._executionQueue, callback, {
 });
 ```
 
-In `Async._forEachWeightedAsync()` (line ~206 of `node-core-library`), the key loop condition is:
+In `Async._forEachWeightedAsync()` (line ~205 of `node-core-library`), the key scheduling logic is (simplified — the actual code has a `limitedConcurrency` lock mechanism for reentrancy safety):
 
 ```typescript
 while (concurrentUnitsInProgress < concurrency && !iteratorIsComplete) {
@@ -128,9 +128,11 @@ const maxParallelism: number = this._parallelism;
 **Cons**: The log message `"Executing a maximum of ${this._parallelism} simultaneous processes..."` might say "10" when only 4 operations exist, which could confuse users.
 **Risk**: None functionally. When all weights = 1, `concurrency = parallelism` still works correctly (the scheduler just won't start more tasks than exist).
 
-### Option B: Remove the cap for the scheduler but keep a display cap for logging (ChatGPT's suggestion)
+### Option B: Remove the cap for the scheduler but add a display cap for logging
 
 ```typescript
+// NEW: Cap the display message to avoid saying "max 10 processes" when only 4 exist.
+// The old code used this._parallelism directly in the display, with no cap.
 const maxSimultaneousProcesses: number = Math.min(totalOperations, this._parallelism);
 this._terminal.writeStdoutLine(`Executing a maximum of ${maxSimultaneousProcesses} simultaneous processes...`);
 
@@ -142,13 +144,15 @@ await Async.forEachAsync(this._executionQueue, callback, {
 });
 ```
 
-**Pros**: Best user messaging; correct scheduling.
-**Cons**: Slightly more change; introduces a variable only used for display.
-**Risk**: Very low.
+**Pros**: Best user messaging (improves over old behavior which showed raw parallelism); correct scheduling.
+**Cons**: Slightly more change; introduces a variable only used for display; changes the display message (old code showed `this._parallelism`, new code shows `Math.min(totalOperations, this._parallelism)`).
+**Risk**: Very low. The display change is an improvement — avoids confusing messages like "max 10 processes" when only 4 exist.
 
 ### Recommendation: **Option B**
 
-It produces better UX (the log still says "max 4 processes" when 4 exist) while fixing the actual scheduling. The log message describes concurrent *processes*, not concurrency *units*, so `min(totalOps, parallelism)` is the right display value.
+It produces better UX (the log now says "max 4 processes" when 4 exist, whereas the old code would have said "max 10") while fixing the actual scheduling. The log message describes concurrent *processes*, not concurrency *units*, so `min(totalOps, parallelism)` is the right display value.
+
+> **Note**: `totalOperations` counts only non-silent operations, so the display represents the max non-silent concurrent processes.
 
 ---
 
@@ -192,9 +196,9 @@ This needs explicit maintainer design approval first.
 
 ### Detailed diff for `OperationExecutionManager.ts`
 
-The change is at lines ~259-262 of `executeAsync()`:
+The change is at lines ~259-265 of `executeAsync()`:
 
-**Before** (current code, lines ~259-265):
+**Before** (pre-fix code):
 ```typescript
     this._terminal.writeStdoutLine(`Executing a maximum of ${this._parallelism} simultaneous processes...`);
 
@@ -203,8 +207,13 @@ The change is at lines ~259-262 of `executeAsync()`:
 
 **After:**
 ```typescript
-    const maxParallelism: number = Math.min(totalOperations, this._parallelism);
-    this._terminal.writeStdoutLine(`Executing a maximum of ${maxParallelism} simultaneous processes...`);
+    // For display purposes, cap the reported number of simultaneous processes by the number of operations.
+    // This avoids confusing messages like "Executing a maximum of 10 simultaneous processes..." when
+    // there are only 4 operations.
+    const maxSimultaneousProcesses: number = Math.min(totalOperations, this._parallelism);
+    this._terminal.writeStdoutLine(
+      `Executing a maximum of ${maxSimultaneousProcesses} simultaneous processes...`
+    );
 ```
 
 And at line ~313 where `concurrency: maxParallelism` is passed:
@@ -222,12 +231,18 @@ And at line ~313 where `concurrency: maxParallelism` is passed:
 ```typescript
       {
         allowOversubscription: this._allowOversubscription,
+        // In weighted mode, concurrency represents the total "unit budget", not the max number of tasks.
+        // Do not cap by totalOperations, since that would incorrectly shrink the unit budget and
+        // reduce parallelism for operations with weight > 1.
         concurrency: this._parallelism,
         weighted: true
       }
 ```
 
-This keeps `maxParallelism` for display purposes only (the log message now correctly uses it), while the scheduler gets the full unit budget.
+Key changes:
+- `maxParallelism` renamed to `maxSimultaneousProcesses` (used for display only)
+- Display message now uses the capped value (previously it showed `this._parallelism` uncapped)
+- Scheduler gets `this._parallelism` directly as the full unit budget
 
 ### Implementation complete
 
@@ -235,6 +250,7 @@ The changes have been applied to both files:
 
 1. **OperationExecutionManager.ts**: 
    - Renamed `maxParallelism` to `maxSimultaneousProcesses` (for display only)
+   - Display message now uses `maxSimultaneousProcesses` instead of raw `this._parallelism`
    - Pass `this._parallelism` directly to `Async.forEachAsync` as the concurrency unit budget
    - Added inline comments explaining the weighted mode semantics
 
@@ -255,7 +271,7 @@ The changes have been applied to both files:
 
 **Scenario**: 4 operations each with `weight=4`, `parallelism=10`, `allowOversubscription=false`. The test tracks `peakConcurrency` using an atomic counter incremented before `await Async.sleepAsync(0)` and decremented after. Asserts `peakConcurrency === 2`.
 
-**Why it's deterministic**: No real time delays. `Async.sleepAsync(0)` yields the microtask queue, allowing other ready operations to start. The weighted scheduler's logic is deterministic given the unit budget — it's not a timing test.
+**Why it's deterministic**: No real time delays. `Async.sleepAsync(0)` yields via `setTimeout(resolve, 0)` (macrotask queue), allowing the weighted scheduler's `_forEachWeightedAsync` loop to start additional operations before the first one completes. The scheduler's logic is deterministic given the unit budget — it's not a timing test.
 
 ### Commands to run locally
 
@@ -307,7 +323,7 @@ When Rush uses weighted scheduling (`Async.forEachAsync` with `weighted: true`),
 ## Details
 
 - Pass `this._parallelism` directly as `concurrency` to `Async.forEachAsync` instead of `Math.min(totalOperations, parallelism)`
-- Keep `Math.min(totalOperations, parallelism)` only for the display message ("Executing a maximum of N simultaneous processes...") to avoid confusing UX
+- Introduce `Math.min(totalOperations, parallelism)` for the display message ("Executing a maximum of N simultaneous processes...") to improve UX — the old code showed the raw parallelism value even when fewer operations existed
 - No API, schema, or config changes
 - Integer weight behavior at weight=1 is unchanged (unit budget ≥ task count is mathematically equivalent)
 
@@ -315,7 +331,7 @@ When Rush uses weighted scheduling (`Async.forEachAsync` with `weighted: true`),
 
 - Added unit test `'does not cap concurrency units by the number of operations'` that creates 4 operations with weight=4, parallelism=10, allowOversubscription=false, and asserts peak concurrency equals 2
 - Ran full `OperationExecutionManager.test.ts` suite locally — all tests pass
-- Existing snapshot tests are unaffected (the display message logic is preserved)
+- Existing snapshot tests are unaffected (all existing tests use `parallelism: 1` with 1-2 operations, so `Math.min(1,1)=1` produces the same display value as the old `this._parallelism`)
 
 ## Impacted documentation
 
@@ -331,8 +347,8 @@ A: The `operation-graph` library's version uses `{ concurrency: maxParallelism }
 **Q2: "Won't this change behavior for users who have all weight=1 (the default)?"**
 A: No. When all weights are 1, the old behavior was `concurrency = min(N, P)`. With the fix, `concurrency = P`. But `Async.forEachAsync` naturally won't start more tasks than exist in the iterator, so the effective concurrency is identical. The only difference is for weights > 1 where the cap was incorrectly shrinking the budget.
 
-**Q3: "The log message now says 'max 4 processes' but we might actually run fewer. Is that misleading?"**
-A: The message describes the maximum number of *simultaneous processes*, which is bounded by `min(totalOps, parallelism)` regardless of weights — you can never have more processes running than operations that exist. The unit budget is a separate (internal) concept. The message was already not perfectly accurate about "units" before this change.
+**Q3: "The log message changed from showing raw parallelism to showing a capped value. Is that intentional?"**
+A: Yes, this is an intentional UX improvement. Previously the message showed `this._parallelism` directly (e.g., "max 10 processes" even with only 4 operations), which could confuse users. Now it shows `min(totalOps, parallelism)`, which better represents the maximum number of *simultaneous processes* — you can never have more processes running than operations that exist. The unit budget used for weighted scheduling is a separate (internal) concept. Note: `totalOperations` counts only non-silent operations.
 
 **Q4: "Should `Async.forEachAsync` itself handle the capping internally?"**
 A: The `Async` utility is a general-purpose tool. It correctly treats `concurrency` as units when `weighted: true`. The caller (`OperationExecutionManager`) was simply passing the wrong value. The fix belongs at the call site.
