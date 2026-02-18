@@ -457,6 +457,44 @@ describe(OperationExecutionManager.name, () => {
   });
 
   describe('Weighted concurrency', () => {
+    // Shared helper: creates an Operation with a given weight whose runner
+    // tracks concurrent-count via the supplied counters object.
+    // The runner increments concurrentCount, updates peakConcurrency,
+    // awaits the provided barrier (or Async.sleepAsync(0) by default),
+    // then decrements concurrentCount.
+    function createWeightedOperation(
+      name: string,
+      weight: number,
+      counters: { concurrentCount: number; peakConcurrency: number },
+      barrier?: () => Promise<void>
+    ): Operation {
+      const operation: Operation = new Operation({
+        runner: new MockOperationRunner(name, async (terminal: CollatedTerminal) => {
+          counters.concurrentCount++;
+          if (counters.concurrentCount > counters.peakConcurrency) {
+            counters.peakConcurrency = counters.concurrentCount;
+          }
+          // Yield to allow other operations to start concurrently.
+          if (barrier) {
+            await barrier();
+          } else {
+            await Async.sleepAsync(0);
+          }
+          // Check again after yielding in case more ops started.
+          if (counters.concurrentCount > counters.peakConcurrency) {
+            counters.peakConcurrency = counters.concurrentCount;
+          }
+          counters.concurrentCount--;
+          return OperationStatus.Success;
+        }),
+        phase: mockPhase,
+        project: getOrCreateProject(name),
+        logFilenameIdentifier: name
+      });
+      operation.weight = weight;
+      return operation;
+    }
+
     it('does not cap concurrency units by the number of operations', async () => {
       // Regression test for https://github.com/microsoft/rushstack/issues/5607
       //
@@ -468,37 +506,12 @@ describe(OperationExecutionManager.name, () => {
       // Scenario: 4 operations each with weight=4, parallelism=10, allowOversubscription=false
       // Expected: 2 operations run concurrently (4+4=8 <= 10), not 1 (which would happen if budget=4).
 
-      let concurrentCount: number = 0;
-      let peakConcurrency: number = 0;
+      const counters = { concurrentCount: 0, peakConcurrency: 0 };
 
-      function createWeightedOperation(name: string): Operation {
-        const operation: Operation = new Operation({
-          runner: new MockOperationRunner(name, async (_terminal: CollatedTerminal) => {
-            concurrentCount++;
-            if (concurrentCount > peakConcurrency) {
-              peakConcurrency = concurrentCount;
-            }
-            // Yield to allow other operations to start concurrently
-            await Async.sleepAsync(0);
-            // Check again after yielding
-            if (concurrentCount > peakConcurrency) {
-              peakConcurrency = concurrentCount;
-            }
-            concurrentCount--;
-            return OperationStatus.Success;
-          }),
-          phase: mockPhase,
-          project: getOrCreateProject(name),
-          logFilenameIdentifier: name
-        });
-        operation.weight = 4;
-        return operation;
-      }
-
-      const opA: Operation = createWeightedOperation('A');
-      const opB: Operation = createWeightedOperation('B');
-      const opC: Operation = createWeightedOperation('C');
-      const opD: Operation = createWeightedOperation('D');
+      const opA: Operation = createWeightedOperation('A', 4, counters);
+      const opB: Operation = createWeightedOperation('B', 4, counters);
+      const opC: Operation = createWeightedOperation('C', 4, counters);
+      const opD: Operation = createWeightedOperation('D', 4, counters);
 
       const manager: OperationExecutionManager = new OperationExecutionManager(
         new Set([opA, opB, opC, opD]),
@@ -517,7 +530,263 @@ describe(OperationExecutionManager.name, () => {
       expect(result.status).toEqual(OperationStatus.Success);
       // With parallelism=10 and weight=4, at most floor(10/4)=2 operations should run concurrently.
       // Before the fix, this would be 1 because the unit budget was capped to 4 (= totalOperations).
-      expect(peakConcurrency).toEqual(2);
+      expect(counters.peakConcurrency).toEqual(2);
+    });
+
+    it('clamps weight to budget and completes without deadlock when weight exceeds budget', async () => {
+      // When an operation's weight exceeds the concurrency budget, Async._forEachWeightedAsync
+      // clamps the effective weight to `Math.min(weight, concurrency)`. This ensures:
+      //   - The operation still runs (no deadlock)
+      //   - Only one such operation runs at a time (it consumes the full budget)
+      //
+      // Scenario: parallelism=4, 2 ops each with weight=10, oversubscription=false
+      // Effective weight = min(10, 4) = 4, so only 1 fits at a time → peak = 1, both complete.
+
+      const counters = { concurrentCount: 0, peakConcurrency: 0 };
+
+      const opA: Operation = createWeightedOperation('heavy-A', 10, counters);
+      const opB: Operation = createWeightedOperation('heavy-B', 10, counters);
+
+      const manager: OperationExecutionManager = new OperationExecutionManager(
+        new Set([opA, opB]),
+        {
+          quietMode: true,
+          debugMode: false,
+          parallelism: 4,
+          allowOversubscription: false,
+          destination: mockWritable
+        }
+      );
+
+      const abortController = new AbortController();
+      const result: IExecutionResult = await manager.executeAsync(abortController);
+
+      expect(result.status).toEqual(OperationStatus.Success);
+      // Both must complete (no deadlock)
+      expect(result.operationResults.get(opA)?.status).toEqual(OperationStatus.Success);
+      expect(result.operationResults.get(opB)?.status).toEqual(OperationStatus.Success);
+      // Only 1 should run at a time since clamped weight (4) fills the entire budget (4)
+      expect(counters.peakConcurrency).toEqual(1);
+    });
+
+    it('allows oversubscription when allowOversubscription is true', async () => {
+      // With allowOversubscription=true, the scheduler starts an operation even if adding
+      // its weight would exceed the budget (as long as concurrentUnitsInProgress < concurrency
+      // when the check is made).
+      //
+      // Scenario: parallelism=10, 2 ops with weight=7, oversubscription=true
+      // First op starts: 0 + 7 = 7 < 10. Second op: 7 < 10 so it starts (7+7=14 > 10 but allowed).
+      // Peak = 2.
+
+      const counters = { concurrentCount: 0, peakConcurrency: 0 };
+
+      const opA: Operation = createWeightedOperation('over-A', 7, counters);
+      const opB: Operation = createWeightedOperation('over-B', 7, counters);
+
+      const manager: OperationExecutionManager = new OperationExecutionManager(
+        new Set([opA, opB]),
+        {
+          quietMode: true,
+          debugMode: false,
+          parallelism: 10,
+          allowOversubscription: true,
+          destination: mockWritable
+        }
+      );
+
+      const abortController = new AbortController();
+      const result: IExecutionResult = await manager.executeAsync(abortController);
+
+      expect(result.status).toEqual(OperationStatus.Success);
+      // Both should run concurrently because oversubscription is allowed
+      expect(counters.peakConcurrency).toEqual(2);
+    });
+
+    it('does not oversubscribe when allowOversubscription is false', async () => {
+      // Same scenario as above but with oversubscription disabled.
+      //
+      // Scenario: parallelism=10, 2 ops with weight=7, oversubscription=false
+      // First op starts: 0 + 7 = 7 ≤ 10. Second op: 7 + 7 = 14 > 10 → blocked.
+      // Peak = 1.
+
+      const counters = { concurrentCount: 0, peakConcurrency: 0 };
+
+      const opA: Operation = createWeightedOperation('strict-A', 7, counters);
+      const opB: Operation = createWeightedOperation('strict-B', 7, counters);
+
+      const manager: OperationExecutionManager = new OperationExecutionManager(
+        new Set([opA, opB]),
+        {
+          quietMode: true,
+          debugMode: false,
+          parallelism: 10,
+          allowOversubscription: false,
+          destination: mockWritable
+        }
+      );
+
+      const abortController = new AbortController();
+      const result: IExecutionResult = await manager.executeAsync(abortController);
+
+      expect(result.status).toEqual(OperationStatus.Success);
+      // Only 1 should run at a time: 7 + 7 = 14 > 10
+      expect(counters.peakConcurrency).toEqual(1);
+    });
+
+    it('zero-weight operations do not consume budget', async () => {
+      // Zero-weight operations should not consume any concurrency units and can
+      // always start alongside other operations.
+      //
+      // Scenario: parallelism=10, 1 op with weight=9 + 3 ops with weight=0
+      // The heavy op takes 9 units; the zero-weight ops take 0 units each.
+      // All 4 should be able to run concurrently (9 + 0 + 0 + 0 = 9 ≤ 10).
+
+      const counters = { concurrentCount: 0, peakConcurrency: 0 };
+
+      const heavyOp: Operation = createWeightedOperation('heavy', 9, counters);
+      const zeroA: Operation = createWeightedOperation('zero-A', 0, counters);
+      const zeroB: Operation = createWeightedOperation('zero-B', 0, counters);
+      const zeroC: Operation = createWeightedOperation('zero-C', 0, counters);
+
+      const manager: OperationExecutionManager = new OperationExecutionManager(
+        new Set([heavyOp, zeroA, zeroB, zeroC]),
+        {
+          quietMode: true,
+          debugMode: false,
+          parallelism: 10,
+          allowOversubscription: false,
+          destination: mockWritable
+        }
+      );
+
+      const abortController = new AbortController();
+      const result: IExecutionResult = await manager.executeAsync(abortController);
+
+      expect(result.status).toEqual(OperationStatus.Success);
+      // All 4 operations should run concurrently since total weight is 9 + 0 + 0 + 0 = 9 ≤ 10
+      expect(counters.peakConcurrency).toBeGreaterThanOrEqual(2);
+    });
+
+    it('mixed weights respect the unit budget correctly', async () => {
+      // Scenario: parallelism=10, ops with weights [5, 5, 3, 3]
+      // First two ops: 5 + 5 = 10 → budget full. Third: 10 + 3 = 13 > 10 → blocked.
+      // Peak = 2 for the first batch.
+
+      const counters = { concurrentCount: 0, peakConcurrency: 0 };
+
+      const opA: Operation = createWeightedOperation('mix-A', 5, counters);
+      const opB: Operation = createWeightedOperation('mix-B', 5, counters);
+      const opC: Operation = createWeightedOperation('mix-C', 3, counters);
+      const opD: Operation = createWeightedOperation('mix-D', 3, counters);
+
+      const manager: OperationExecutionManager = new OperationExecutionManager(
+        new Set([opA, opB, opC, opD]),
+        {
+          quietMode: true,
+          debugMode: false,
+          parallelism: 10,
+          allowOversubscription: false,
+          destination: mockWritable
+        }
+      );
+
+      const abortController = new AbortController();
+      const result: IExecutionResult = await manager.executeAsync(abortController);
+
+      expect(result.status).toEqual(OperationStatus.Success);
+      // All 4 operations must complete
+      for (const [, opResult] of result.operationResults) {
+        expect(opResult.status).toEqual(OperationStatus.Success);
+      }
+      // Peak should be at least 2 (the two weight-5 ops fit, or two weight-3 ops fit after)
+      expect(counters.peakConcurrency).toBeGreaterThanOrEqual(2);
+      // Peak cannot exceed 3 (no combination of 4 ops can fit: 5+5+3=13 > 10, 3+3+5=11 > 10)
+      expect(counters.peakConcurrency).toBeLessThanOrEqual(3);
+    });
+
+    it('weight=1 operations behave identically to unweighted (default behavior)', async () => {
+      // When all operations have weight=1 (the default), weighted scheduling should behave
+      // the same as unweighted: up to `parallelism` operations run concurrently.
+      //
+      // Scenario: parallelism=3, 5 ops each with weight=1
+      // Peak should be 3 (the budget allows 3 units, each op takes 1 unit).
+
+      const counters = { concurrentCount: 0, peakConcurrency: 0 };
+
+      const ops: Operation[] = [];
+      for (let i = 0; i < 5; i++) {
+        ops.push(createWeightedOperation(`unit-${i}`, 1, counters));
+      }
+
+      const manager: OperationExecutionManager = new OperationExecutionManager(new Set(ops), {
+        quietMode: true,
+        debugMode: false,
+        parallelism: 3,
+        allowOversubscription: false,
+        destination: mockWritable
+      });
+
+      const abortController = new AbortController();
+      const result: IExecutionResult = await manager.executeAsync(abortController);
+
+      expect(result.status).toEqual(OperationStatus.Success);
+      // With weight=1 and parallelism=3, peak concurrent ops should be exactly 3
+      expect(counters.peakConcurrency).toEqual(3);
+    });
+
+    it('displays the correct log message with capped process count', async () => {
+      // The fix introduced a display improvement: the log message shows
+      // min(totalOperations, parallelism) instead of raw parallelism.
+      // With 4 operations and parallelism=10, the message should say "4" not "10".
+
+      const counters = { concurrentCount: 0, peakConcurrency: 0 };
+
+      const ops: Operation[] = [];
+      for (let i = 0; i < 4; i++) {
+        ops.push(createWeightedOperation(`log-${i}`, 4, counters));
+      }
+
+      const manager: OperationExecutionManager = new OperationExecutionManager(new Set(ops), {
+        quietMode: false,
+        debugMode: false,
+        parallelism: 10,
+        allowOversubscription: false,
+        destination: mockWritable
+      });
+
+      const abortController = new AbortController();
+      await manager.executeAsync(abortController);
+
+      const allOutput: string = mockWritable.getAllOutput();
+      // Should say "4 simultaneous processes" (min(4, 10) = 4), not "10"
+      expect(allOutput).toContain('Executing a maximum of 4 simultaneous processes...');
+      expect(allOutput).not.toContain('Executing a maximum of 10 simultaneous processes...');
+    });
+
+    it('displays parallelism when it is less than operation count', async () => {
+      // When parallelism < totalOperations, the message should show parallelism.
+      // With 10 operations and parallelism=3, the message should say "3".
+
+      const counters = { concurrentCount: 0, peakConcurrency: 0 };
+
+      const ops: Operation[] = [];
+      for (let i = 0; i < 10; i++) {
+        ops.push(createWeightedOperation(`many-${i}`, 1, counters));
+      }
+
+      const manager: OperationExecutionManager = new OperationExecutionManager(new Set(ops), {
+        quietMode: false,
+        debugMode: false,
+        parallelism: 3,
+        allowOversubscription: false,
+        destination: mockWritable
+      });
+
+      const abortController = new AbortController();
+      await manager.executeAsync(abortController);
+
+      const allOutput: string = mockWritable.getAllOutput();
+      expect(allOutput).toContain('Executing a maximum of 3 simultaneous processes...');
     });
   });
 });
