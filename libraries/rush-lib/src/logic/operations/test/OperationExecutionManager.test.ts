@@ -18,6 +18,7 @@ jest.mock('@rushstack/terminal', () => {
 
 import { Terminal, MockWritable, PrintUtilities } from '@rushstack/terminal';
 import { CollatedTerminal } from '@rushstack/stream-collator';
+import { Async } from '@rushstack/node-core-library';
 
 import type { IPhase } from '../../../api/CommandLineConfiguration';
 import type { RushConfigurationProject } from '../../../api/RushConfigurationProject';
@@ -452,6 +453,71 @@ describe(OperationExecutionManager.name, () => {
       expect(allMessages).toContain('Build step 1');
       expect(allMessages).toContain('Warning: step 1 succeeded with warnings');
       expect(mockWritable.getFormattedChunks()).toMatchSnapshot();
+    });
+  });
+
+  describe('Weighted concurrency', () => {
+    it('does not cap concurrency units by the number of operations', async () => {
+      // Regression test for https://github.com/microsoft/rushstack/issues/5607
+      //
+      // When using weighted scheduling, `concurrency` means "unit budget", not "max task count".
+      // Previously, Rush capped `concurrency` by `Math.min(totalOperations, parallelism)`,
+      // which would shrink the unit budget when totalOperations < parallelism,
+      // causing operations with weight > 1 to run sequentially instead of in parallel.
+      //
+      // Scenario: 4 operations each with weight=4, parallelism=10, allowOversubscription=false
+      // Expected: 2 operations run concurrently (4+4=8 <= 10), not 1 (which would happen if budget=4).
+
+      let concurrentCount: number = 0;
+      let peakConcurrency: number = 0;
+
+      function createWeightedOperation(name: string): Operation {
+        const operation: Operation = new Operation({
+          runner: new MockOperationRunner(name, async (_terminal: CollatedTerminal) => {
+            concurrentCount++;
+            if (concurrentCount > peakConcurrency) {
+              peakConcurrency = concurrentCount;
+            }
+            // Yield to allow other operations to start concurrently
+            await Async.sleepAsync(0);
+            // Check again after yielding
+            if (concurrentCount > peakConcurrency) {
+              peakConcurrency = concurrentCount;
+            }
+            concurrentCount--;
+            return OperationStatus.Success;
+          }),
+          phase: mockPhase,
+          project: getOrCreateProject(name),
+          logFilenameIdentifier: name
+        });
+        operation.weight = 4;
+        return operation;
+      }
+
+      const opA: Operation = createWeightedOperation('A');
+      const opB: Operation = createWeightedOperation('B');
+      const opC: Operation = createWeightedOperation('C');
+      const opD: Operation = createWeightedOperation('D');
+
+      const manager: OperationExecutionManager = new OperationExecutionManager(
+        new Set([opA, opB, opC, opD]),
+        {
+          quietMode: true,
+          debugMode: false,
+          parallelism: 10,
+          allowOversubscription: false,
+          destination: mockWritable
+        }
+      );
+
+      const abortController = new AbortController();
+      const result: IExecutionResult = await manager.executeAsync(abortController);
+
+      expect(result.status).toEqual(OperationStatus.Success);
+      // With parallelism=10 and weight=4, at most floor(10/4)=2 operations should run concurrently.
+      // Before the fix, this would be 1 because the unit budget was capped to 4 (= totalOperations).
+      expect(peakConcurrency).toEqual(2);
     });
   });
 });
